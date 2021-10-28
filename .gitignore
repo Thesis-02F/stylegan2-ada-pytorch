@@ -1,5 +1,5 @@
 __pycache__/
 .cache/
 training-runs/
-venv/
-out/
+venv*/
+out*/
