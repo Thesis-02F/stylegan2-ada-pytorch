@@ -11,6 +11,7 @@ idna==3.3
 importlib-metadata==4.8.1
 Markdown==3.3.4
 numpy==1.19.5
+nltk==3.6.5
 oauthlib==3.1.1
 Pillow==8.4.0
 pkg_resources==0.0.0
