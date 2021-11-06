@@ -20,7 +20,7 @@ from nltk.tokenize import RegexpTokenizer
 from collections import defaultdict
 
 try:
-    import pyspng
+    import pyspng # type: ignore
 except ImportError:
     pyspng = None
 
@@ -60,14 +60,17 @@ class Dataset(torch.utils.data.Dataset):
 
     def _get_raw_labels(self):
         if self._raw_labels is None:
-            self._raw_labels = self._load_raw_labels() if self._use_labels else None
+            if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
+                self._raw_labels = self._load_raw_caption(0)
+            else:    
+                self._raw_labels = self._load_raw_labels() if self._use_labels else None
             if self._raw_labels is None:
                 self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
             assert isinstance(self._raw_labels, np.ndarray)
-            assert self._raw_labels.shape[0] == self._raw_shape[0]
+            # assert self._raw_labels.shape[0] == self._raw_shape[0]
             assert self._raw_labels.dtype in [np.float32, np.int64]
             if self._raw_labels.dtype == np.int64:
-                assert self._raw_labels.ndim == 1
+                # assert self._raw_labels.ndim == 1
                 assert np.all(self._raw_labels >= 0)
         return self._raw_labels
 
@@ -104,10 +107,10 @@ class Dataset(torch.utils.data.Dataset):
             assert image.ndim == 3 # CHW
             image = image[:, :, ::-1]
 
-        if self.name == 'birds' and self._use_labels:
+        if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
             sent_ix = np.random.randint(0, self.embeddings_num)
             new_sent_ix = idx * self.embeddings_num + sent_ix
-            caps, cap_len = self._load_raw_caption(new_sent_ix)
+            caps = self._load_raw_caption(new_sent_ix)
             return image.copy(), caps.squeeze()
         
         return image.copy(), self.get_label(idx)
@@ -158,6 +161,8 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def label_dim(self):
+        if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
+            return 256
         assert len(self.label_shape) == 1
         return self.label_shape[0]
 
@@ -367,7 +372,7 @@ class TextDataset(Dataset):
             ix = np.sort(ix)
             x[:, 0] = sent_caption[ix]
             x_len = TEXT_WORDS_NUM
-        return x, x_len
+        return x#, x_len
 
     # def _load_raw_labels(self):
     #     sent_ix = np.random.randint(0, self.embeddings_num, self._raw_shape[0])
