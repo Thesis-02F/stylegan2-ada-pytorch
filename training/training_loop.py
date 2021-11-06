@@ -24,6 +24,8 @@ from torch_utils.ops import grid_sample_gradfix
 import legacy
 from metrics import metric_main
 
+from transformers import GPT2Model
+
 #----------------------------------------------------------------------------
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
@@ -32,7 +34,7 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
     gh = np.clip(4320 // training_set.image_shape[1], 4, 4) # * this one for the number of row
 
     # No labels => show random subset of training samples.
-    if not training_set.has_labels:
+    if not training_set.has_labels or training_set.name == 'birds': #TODO: make conditional on captions not name
         all_indices = list(range(len(training_set)))
         rnd.shuffle(all_indices)
         grid_indices = [all_indices[i % len(all_indices)] for i in range(gw * gh)]
@@ -146,6 +148,13 @@ def training_loop(
     # Construct networks.
     if rank == 0:
         print('Constructing networks...')
+    T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
+    state_dict = torch.load('', map_location=lambda storage, loc: storage)
+    T_encoder.load_state_dict(state_dict)
+    for p in T_encoder.parameters():
+        p.requires_grad = False
+    T_encoder.eval()
+
     common_kwargs = dict(c_dim=training_set.label_dim, img_resolution=training_set.resolution, img_channels=training_set.num_channels)
     G = dnnlib.util.construct_class_by_name(**G_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
     D = dnnlib.util.construct_class_by_name(**D_kwargs, **common_kwargs).train().requires_grad_(False).to(device) # subclass of torch.nn.Module
@@ -225,6 +234,11 @@ def training_loop(
         grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
         images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        with open(os.path.join(run_dir, 'captions.txt'), 'w') as f:
+            for label in labels:
+                l = np.argwhere(label).squeeze()[-1] + 1 # length of text
+                f.write(' '.join([training_set.ixtoword[i] for i in label[:l]]))
+                f.write('\n')
 
     # Initialize logs.
     if rank == 0:
@@ -258,6 +272,8 @@ def training_loop(
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(training_set_iterator)
+            words_embs = T_encoder(phase_real_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+            phase_real_c = words_embs[ :, :, -1 ].contiguous()
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)

@@ -30,6 +30,7 @@ tensorboard-plugin-wit==1.8.0
 torch==1.7.1+cu110
 torchvision==0.8.2+cu110
 tqdm==4.62.3
+transformers==4.12.3
 typing-extensions==3.10.0.2
 urllib3==1.26.7
 Werkzeug==2.0.2
