@@ -108,7 +108,7 @@ class Dataset(torch.utils.data.Dataset):
             sent_ix = np.random.randint(0, self.embeddings_num)
             new_sent_ix = idx * self.embeddings_num + sent_ix
             caps, cap_len = self._load_raw_caption(new_sent_ix)
-            return image.copy(), caps
+            return image.copy(), caps.squeeze()
         
         return image.copy(), self.get_label(idx)
 
