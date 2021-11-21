@@ -149,8 +149,8 @@ def training_loop(
     if rank == 0:
         print('Constructing networks...')
     T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
-    state_dict = torch.load('', map_location=lambda storage, loc: storage)
-    T_encoder.load_state_dict(state_dict)
+    # state_dict = torch.load('', map_location=lambda storage, loc: storage) #TODO: we need a pretrained model for DMSM
+    # T_encoder.load_state_dict(state_dict)
     for p in T_encoder.parameters():
         p.requires_grad = False
     T_encoder.eval()
@@ -229,9 +229,14 @@ def training_loop(
     if rank == 0:
         print('Exporting sample images...')
         grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+        grid_c = torch.from_numpy(labels).to(device) #TODO: distributed implementation
+        # captions = torch.autograd.Variable(torch.from_numpy(labels.squeeze())).cuda() #TODO: check why autograd is needed
+        words_embs = T_encoder(grid_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+        grid_c = words_embs[ :, :, -1 ].contiguous()
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
-        grid_c = torch.from_numpy(labels).to(device).split(batch_gpu)
+        grid_c = grid_c.split(batch_gpu)
+        # grid_c = torch.from_numpy(captions).to(device).split(batch_gpu)
         images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
         with open(os.path.join(run_dir, 'captions.txt'), 'w') as f:
@@ -272,14 +277,18 @@ def training_loop(
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c = next(training_set_iterator)
+            phase_real_c = phase_real_c.to(device)
             words_embs = T_encoder(phase_real_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
             phase_real_c = words_embs[ :, :, -1 ].contiguous()
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
-            phase_real_c = phase_real_c.to(device).split(batch_gpu)
+            phase_real_c = phase_real_c.split(batch_gpu)
+            # phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
             all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
-            all_gen_c = torch.from_numpy(np.stack(all_gen_c)).pin_memory().to(device)
+            all_gen_c = torch.from_numpy(np.stack(all_gen_c).squeeze()).pin_memory().to(device) #TODO: remove squeeze()
+            words_embs = T_encoder(all_gen_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+            all_gen_c = words_embs[ :, :, -1 ].contiguous()
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
         # Execute training phases.

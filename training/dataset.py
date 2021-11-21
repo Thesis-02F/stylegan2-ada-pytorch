@@ -40,7 +40,7 @@ class Dataset(torch.utils.data.Dataset):
         xflip       = False,    # Artificially double the size of the dataset via x-flips. Applied after max_size.
         random_seed = 0,        # Random seed to use when applying max_size.
     ):
-        self._name = name
+        self._name = name #TODO: works only with birds not birds/
         self._raw_shape = list(raw_shape)
         self._use_labels = use_labels
         self._raw_labels = None
@@ -61,14 +61,15 @@ class Dataset(torch.utils.data.Dataset):
     def _get_raw_labels(self):
         if self._raw_labels is None:
             if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
-                self._raw_labels = self._load_raw_caption(0)
+                self._raw_labels = self._load_raw_captions()
             else:    
                 self._raw_labels = self._load_raw_labels() if self._use_labels else None
             if self._raw_labels is None:
                 self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
-            assert isinstance(self._raw_labels, np.ndarray)
+            self._raw_labels = np.asarray(self._raw_labels).astype('int64') #TODO: remove force type casting
+            assert isinstance(self._raw_labels, np.ndarray) or isinstance(self._raw_labels, torch.Tensor) #TODO: change this to reflect captions not labels
             # assert self._raw_labels.shape[0] == self._raw_shape[0]
-            assert self._raw_labels.dtype in [np.float32, np.int64]
+            assert self._raw_labels.dtype in [np.float32, np.int64, torch.float32] #TODO: change this to reflect captions not labels
             if self._raw_labels.dtype == np.int64:
                 # assert self._raw_labels.ndim == 1
                 assert np.all(self._raw_labels >= 0)
@@ -109,7 +110,7 @@ class Dataset(torch.utils.data.Dataset):
 
         if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
             sent_ix = np.random.randint(0, self.embeddings_num)
-            new_sent_ix = idx * self.embeddings_num + sent_ix
+            new_sent_ix = self._raw_idx[idx] * self.embeddings_num + sent_ix
             caps = self._load_raw_caption(new_sent_ix)
             return image.copy(), caps.squeeze()
         
@@ -117,7 +118,8 @@ class Dataset(torch.utils.data.Dataset):
 
     def get_label(self, idx):
         label = self._get_raw_labels()[self._raw_idx[idx]]
-        if label.dtype == np.int64:
+        #TODO: change this to reflect captions not labels
+        if label.dtype == np.int64 and not (self.name == 'birds' and self._use_labels):
             onehot = np.zeros(self.label_shape, dtype=np.float32)
             onehot[label] = 1
             label = onehot
@@ -151,6 +153,8 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def label_shape(self):
+        if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
+            return [768]
         if self._label_shape is None:
             raw_labels = self._get_raw_labels()
             if raw_labels.dtype == np.int64:
@@ -161,8 +165,6 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def label_dim(self):
-        if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
-            return 256
         assert len(self.label_shape) == 1
         return self.label_shape[0]
 
@@ -265,6 +267,7 @@ TEXT_WORDS_NUM = 18
 class TextDataset(Dataset):
     def __init__(self,
         path,                   # Path to directory.
+        resolution = None,      # For compatibility with Dataset #TODO: remeber to resolve
         size = 256,             # Image size to be resized.
         **super_kwargs,         # Additional arguments for the Dataset base class.
     ):
@@ -372,8 +375,15 @@ class TextDataset(Dataset):
             ix = np.sort(ix)
             x[:, 0] = sent_caption[ix]
             x_len = TEXT_WORDS_NUM
+        
+        # sorted_cap_lens, sorted_cap_indices = torch.sort(x, 0, True)
+        # x = x[sorted_cap_indices].squeeze()
+        # x = torch.autograd.Variable(torch.Tensor(x.squeeze())).cuda() #TODO: check why autograd is needed
         return x#, x_len
 
+    def _load_raw_captions(self):
+        return [self._load_raw_caption(i) for i in self._raw_idx]
+    
     # def _load_raw_labels(self):
     #     sent_ix = np.random.randint(0, self.embeddings_num, self._raw_shape[0])
     #     new_sent_ix = np.arange(self._raw_shape[0]).astype('int64') * self.embeddings_num + sent_ix
