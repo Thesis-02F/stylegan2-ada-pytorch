@@ -24,7 +24,8 @@ from torch_utils.ops import grid_sample_gradfix
 import legacy
 from metrics import metric_main
 
-from transformers import GPT2Model
+# from transformers import GPT2Model
+from transformers import BertModel, BertTokenizer
 
 #----------------------------------------------------------------------------
 
@@ -62,8 +63,8 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
             label_groups[label] = [indices[(i + gw) % len(indices)] for i in range(len(indices))]
 
     # Load data.
-    images, labels = zip(*[training_set[i] for i in grid_indices])
-    return (gw, gh), np.stack(images), np.stack(labels)
+    images, labels, labels_len = zip(*[training_set[i] for i in grid_indices])
+    return (gw, gh), np.stack(images), np.stack(labels), np.array(labels_len)
 
 #----------------------------------------------------------------------------
 
@@ -148,7 +149,11 @@ def training_loop(
     # Construct networks.
     if rank == 0:
         print('Constructing networks...')
-    T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
+    # T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
+    T_encoder = BertModel.from_pretrained('bert-base-uncased').to(device) #TODO: inistantiate this only when using captions
+    #! Some weights of the model checkpoint at bert-base-uncased were not used when initializing BertModel: ['cls.predictions.transform.dense.weight', 'cls.predictions.transform.LayerNorm.bias', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.transform.dense.bias', 'cls.predictions.bias', 'cls.seq_relationship.weight', 'cls.predictions.decoder.weight', 'cls.seq_relationship.bias']
+    #! - This IS expected if you are initializing BertModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
+    #! - This IS NOT expected if you are initializing BertModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
     # state_dict = torch.load('', map_location=lambda storage, loc: storage) #TODO: we need a pretrained model for DMSM
     # T_encoder.load_state_dict(state_dict)
     for p in T_encoder.parameters():
@@ -228,21 +233,29 @@ def training_loop(
     grid_c = None
     if rank == 0:
         print('Exporting sample images...')
-        grid_size, images, labels = setup_snapshot_image_grid(training_set=training_set)
+        grid_size, images, labels, labels_len = setup_snapshot_image_grid(training_set=training_set)
         grid_c = torch.from_numpy(labels).to(device) #TODO: distributed implementation
+        grid_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in labels_len]
+        grid_c_mask = torch.from_numpy(np.array(grid_c_mask)).to(device)
         # captions = torch.autograd.Variable(torch.from_numpy(labels.squeeze())).cuda() #TODO: check why autograd is needed
-        words_embs = T_encoder(grid_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
-        grid_c = words_embs[ :, :, -1 ].contiguous()
+        # words_embs = T_encoder(grid_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+        words_embs = T_encoder(grid_c, attention_mask=grid_c_mask)[0].contiguous()
+        # grid_c = words_embs[ :, :, -1 ].contiguous() # used with gpt2
+        max_len = torch.sum(grid_c_mask, dim=1).to(device)
+        sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
+        grid_c = sent_embedding.contiguous()
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = grid_c.split(batch_gpu)
         # grid_c = torch.from_numpy(captions).to(device).split(batch_gpu)
         images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased') #TODO: make a universal tokenizer
         with open(os.path.join(run_dir, 'captions.txt'), 'w') as f:
-            for label in labels:
-                l = np.argwhere(label).squeeze()[-1] + 1 # length of text
-                f.write(' '.join([training_set.ixtoword[i] for i in label[:l]]))
+            for label, label_len in zip(labels, labels_len):
+                # l = np.argwhere(label).squeeze()[-1] + 1 # length of text
+                # f.write(' '.join([training_set.ixtoword[i] for i in label[:l]]))
+                f.write(' '.join(tokenizer.convert_ids_to_tokens(label[:label_len])))
                 f.write('\n')
 
     # Initialize logs.
@@ -276,19 +289,32 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
-            phase_real_img, phase_real_c = next(training_set_iterator)
+            phase_real_img, phase_real_c, phase_real_c_lens = next(training_set_iterator)
             phase_real_c = phase_real_c.to(device)
-            words_embs = T_encoder(phase_real_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
-            phase_real_c = words_embs[ :, :, -1 ].contiguous()
+            phase_real_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in phase_real_c_lens]
+            phase_real_c_mask = torch.from_numpy(np.array(phase_real_c_mask)).to(device)
+            # words_embs = T_encoder(phase_real_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+            words_embs = T_encoder(phase_real_c, attention_mask=phase_real_c_mask)[0].contiguous() #TODO: change this to reflect captions not labels
+            # phase_real_c = words_embs[ :, :, -1 ].contiguous()
+            max_len = torch.sum(phase_real_c_mask, dim=1).to(device)
+            sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
+            phase_real_c = sent_embedding.contiguous()
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.split(batch_gpu)
             # phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
-            all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
+            # all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
+            all_gen_c, all_gen_c_lens = zip(*[training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)])
+            all_gen_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in all_gen_c_lens]
+            all_gen_c_mask = torch.from_numpy(np.array(all_gen_c_mask)).to(device)
             all_gen_c = torch.from_numpy(np.stack(all_gen_c).squeeze()).pin_memory().to(device) #TODO: remove squeeze()
-            words_embs = T_encoder(all_gen_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
-            all_gen_c = words_embs[ :, :, -1 ].contiguous()
+            # words_embs = T_encoder(all_gen_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+            words_embs = T_encoder(all_gen_c, attention_mask=all_gen_c_mask)[0].contiguous() #TODO: change this to reflect captions not labels
+            # all_gen_c = words_embs[ :, :, -1 ].contiguous()
+            max_len = torch.sum(all_gen_c_mask, dim=1).to(device)
+            sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
+            all_gen_c = sent_embedding.contiguous()
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 
         # Execute training phases.

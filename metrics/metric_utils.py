@@ -16,7 +16,8 @@ import numpy as np
 import torch
 import dnnlib
 
-from transformers import GPT2Model
+# from transformers import GPT2Model
+from transformers import BertModel
 
 #----------------------------------------------------------------------------
 
@@ -259,16 +260,24 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
     detector = get_feature_detector(url=detector_url, device=opts.device, num_gpus=opts.num_gpus, rank=opts.rank, verbose=progress.verbose)
 
     # Main loop.
-    device = torch.device('cuda', 0)
-    T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
+    # device = torch.device('cuda', 0)
+    # T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
+    T_encoder = BertModel.from_pretrained('bert-base-uncased').to(opts.device) #TODO: inistantiate this only when using captions
     while not stats.is_full():
         images = []
         for _i in range(batch_size // batch_gen):
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
-            c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_gen)]
+            # c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_gen)]
+            c, c_lens = zip(*[dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_gen)])
+            c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in c_lens]
+            c_mask = torch.from_numpy(np.array(c_mask)).to(opts.device)
             c = torch.from_numpy(np.stack(c).squeeze()).pin_memory().to(opts.device) #TODO: remove squeeze()
-            words_embs = T_encoder(c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
-            c = words_embs[ :, :, -1 ].contiguous()
+            # words_embs = T_encoder(c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+            words_embs = T_encoder(c, attention_mask=c_mask)[0].contiguous() #TODO: change this to reflect captions not labels
+            # c = words_embs[ :, :, -1 ].contiguous()
+            max_len = torch.sum(c_mask, dim=1).to(opts.device)
+            sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
+            c = sent_embedding.contiguous()
             images.append(run_generator(z, c))
         images = torch.cat(images)
         if images.shape[1] == 1:

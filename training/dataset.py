@@ -17,7 +17,9 @@ import torch
 import dnnlib
 
 from nltk.tokenize import RegexpTokenizer
+from transformers import BertTokenizer
 from collections import defaultdict
+from tqdm import tqdm
 
 try:
     import pyspng # type: ignore
@@ -66,13 +68,13 @@ class Dataset(torch.utils.data.Dataset):
                 self._raw_labels = self._load_raw_labels() if self._use_labels else None
             if self._raw_labels is None:
                 self._raw_labels = np.zeros([self._raw_shape[0], 0], dtype=np.float32)
-            self._raw_labels = np.asarray(self._raw_labels).astype('int64') #TODO: remove force type casting
-            assert isinstance(self._raw_labels, np.ndarray) or isinstance(self._raw_labels, torch.Tensor) #TODO: change this to reflect captions not labels
+            self._raw_labels = np.asarray(self._raw_labels[0]).astype('int64'), self._raw_labels[1] #TODO: remove force type casting
+            assert isinstance(self._raw_labels[0], np.ndarray) or isinstance(self._raw_labels[0], torch.Tensor) #TODO: change this to reflect captions not labels
             # assert self._raw_labels.shape[0] == self._raw_shape[0]
-            assert self._raw_labels.dtype in [np.float32, np.int64, torch.float32] #TODO: change this to reflect captions not labels
-            if self._raw_labels.dtype == np.int64:
+            assert self._raw_labels[0].dtype in [np.float32, np.int64, torch.float32] #TODO: change this to reflect captions not labels
+            if self._raw_labels[0].dtype == np.int64:
                 # assert self._raw_labels.ndim == 1
-                assert np.all(self._raw_labels >= 0)
+                assert np.all(self._raw_labels[0] >= 0) #TODO: remove all [0]s if length is removed
         return self._raw_labels
 
     def close(self): # to be overridden by subclass
@@ -111,25 +113,27 @@ class Dataset(torch.utils.data.Dataset):
         if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
             sent_ix = np.random.randint(0, self.embeddings_num)
             new_sent_ix = self._raw_idx[idx] * self.embeddings_num + sent_ix
-            caps = self._load_raw_caption(new_sent_ix)
-            return image.copy(), caps.squeeze()
+            caps, caps_len = self._load_raw_caption(new_sent_ix)
+            return image.copy(), caps.squeeze(), caps_len
         
         return image.copy(), self.get_label(idx)
 
     def get_label(self, idx):
-        label = self._get_raw_labels()[self._raw_idx[idx]]
+        label = self._get_raw_labels()
+        label = label[0][self._raw_idx[idx]], label[1][self._raw_idx[idx]]
         #TODO: change this to reflect captions not labels
-        if label.dtype == np.int64 and not (self.name == 'birds' and self._use_labels):
+        if label[0].dtype == np.int64 and not (self.name == 'birds' and self._use_labels): #TODO: remove if length is removed
             onehot = np.zeros(self.label_shape, dtype=np.float32)
             onehot[label] = 1
             label = onehot
-        return label.copy()
+        # return label.copy()
+        return label+tuple()
 
     def get_details(self, idx):
         d = dnnlib.EasyDict()
         d.raw_idx = int(self._raw_idx[idx])
         d.xflip = (int(self._xflip[idx]) != 0)
-        d.raw_label = self._get_raw_labels()[d.raw_idx].copy()
+        d.raw_label = self._get_raw_labels()[0][d.raw_idx].copy() #TODO: remove if length is removed
         return d
 
     @property
@@ -156,7 +160,7 @@ class Dataset(torch.utils.data.Dataset):
         if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
             return [768]
         if self._label_shape is None:
-            raw_labels = self._get_raw_labels()
+            raw_labels = self._get_raw_labels()[0] #TODO: remove if length is removed
             if raw_labels.dtype == np.int64:
                 self._label_shape = [int(np.max(raw_labels)) + 1]
             else:
@@ -174,7 +178,7 @@ class Dataset(torch.utils.data.Dataset):
 
     @property
     def has_onehot_labels(self):
-        return self._get_raw_labels().dtype == np.int64
+        return self._get_raw_labels()[0].dtype == np.int64 #TODO: remove if length is removed
 
 #----------------------------------------------------------------------------
 
@@ -263,7 +267,7 @@ class ImageFolderDataset(Dataset):
 #----------------------------------------------------------------------------
 
 TEXT_CAPTIONS_PER_IMAGE = 10
-TEXT_WORDS_NUM = 18
+TEXT_WORDS_NUM = 18+2
 class TextDataset(Dataset):
     def __init__(self,
         path,                   # Path to directory.
@@ -373,16 +377,18 @@ class TextDataset(Dataset):
             np.random.shuffle(ix)
             ix = ix[:TEXT_WORDS_NUM]
             ix = np.sort(ix)
+            ix[0] = 0
+            ix[-1] = num_words - 1 # to handle cls and sep tokens
             x[:, 0] = sent_caption[ix]
             x_len = TEXT_WORDS_NUM
         
         # sorted_cap_lens, sorted_cap_indices = torch.sort(x, 0, True)
         # x = x[sorted_cap_indices].squeeze()
         # x = torch.autograd.Variable(torch.Tensor(x.squeeze())).cuda() #TODO: check why autograd is needed
-        return x#, x_len
+        return x, x_len
 
     def _load_raw_captions(self):
-        return [self._load_raw_caption(i) for i in self._raw_idx]
+        return [self._load_raw_caption(i)[0] for i in self._raw_idx], [self._load_raw_caption(i)[1] for i in self._raw_idx]
     
     # def _load_raw_labels(self):
     #     sent_ix = np.random.randint(0, self.embeddings_num, self._raw_shape[0])
@@ -416,10 +422,10 @@ class TextDataset(Dataset):
     
     def load_captions(self, data_dir, filenames):
         all_captions = []
-        for i in range(len(filenames)):
+        for i in tqdm(range(len(filenames)), ascii=True):
             cap_path = '%s/text/%s.txt' % (data_dir, filenames[i])
             with open(cap_path, "r") as f:
-                captions = f.read().decode('utf8').split('\n')
+                captions = f.read().split('\n')
                 cnt = 0
                 for cap in captions:
                     if len(cap) == 0:
@@ -427,6 +433,7 @@ class TextDataset(Dataset):
                     cap = cap.replace("\ufffd\ufffd", " ")
                     # picks out sequences of alphanumeric characters as tokens
                     # and drops everything else
+                    # tokenizer = BertTokenizer.from_pretrained('bert-base-uncased') #TODO: make a universal tokenizer
                     tokenizer = RegexpTokenizer(r'\w+')
                     tokens = tokenizer.tokenize(cap.lower())
                     if len(tokens) == 0:
@@ -509,6 +516,24 @@ class TextDataset(Dataset):
                 del x
                 n_words = len(ixtoword)
                 print('Load from: ', filepath)
+
+        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased') #TODO: make a universal tokenizer
+        all_tokens_train = []
+        for tokens in train_captions:
+            tokens = [ixtoword[i] for i in tokens]
+            tokens = ['[CLS]'] + tokens + ['[SEP]']
+            tokens = tokenizer.convert_tokens_to_ids(tokens)
+            all_tokens_train.append(tokens)
+        all_tokens_test = []
+        for tokens in test_captions:
+            tokens = [ixtoword[i] for i in tokens]
+            tokens = ['[CLS]'] + tokens + ['[SEP]']
+            tokens = tokenizer.convert_tokens_to_ids(tokens)
+            all_tokens_test.append(tokens)
+        
+        train_captions = all_tokens_train
+        test_captions = all_tokens_test
+
         if split == 'train':
             # a list of list: each list contains
             # the indices of words in a sentence
