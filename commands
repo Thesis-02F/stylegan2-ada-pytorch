@@ -1,0 +1,1 @@
+python3 train.py --outdir=./training-runs --data=/home/mohamedo/Style-AttnGAN/data/birds --aug=noaug --cond=1 --gpus=2

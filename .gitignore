@@ -3,3 +3,5 @@ __pycache__/
 training-runs/
 venv*/
 out*/
+.vscode
+pretrained

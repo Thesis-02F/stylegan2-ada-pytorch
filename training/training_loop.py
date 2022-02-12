@@ -27,6 +27,50 @@ from metrics import metric_main
 # from transformers import GPT2Model
 from transformers import BertModel, BertTokenizer
 
+TRAIN_NET_E = './pretrained/text_encoder200.pth'
+TEXT_EMBEDDING_DIM = 256
+TEXT_WORDS_NUM = 18#+2
+
+#----------------------------------------------------------------------------
+
+from torch.autograd import Variable
+def prepare_data(imgs, captions, captions_lens):
+    #! changes this to a separate input
+    CUDA = True
+    # imgs, captions, captions_lens, class_ids, keys = data
+
+    # sort data by the length in a descending order
+    sorted_cap_lens, sorted_cap_indices = \
+        torch.sort(captions_lens, 0, True)
+
+    if imgs is not None:
+        real_imgs = imgs[sorted_cap_indices]
+        if CUDA:
+            real_imgs = Variable(real_imgs).cuda()
+        else:
+            real_imgs = Variable(real_imgs)
+    else:
+        real_imgs = None
+    # for i in range(len(imgs)):
+    #     imgs[i] = imgs[i][sorted_cap_indices]
+    #     if CUDA:
+    #         real_imgs.append(Variable(imgs[i]).cuda())
+    #     else:
+    #         real_imgs.append(Variable(imgs[i]))
+
+    captions = captions[sorted_cap_indices].squeeze()
+    # class_ids = class_ids[sorted_cap_indices].numpy()
+    # sent_indices = sent_indices[sorted_cap_indices]
+    # keys = [keys[i] for i in sorted_cap_indices.numpy()]
+    # print('keys', type(keys), keys[-1])  # list
+    if CUDA:
+        captions = Variable(captions).cuda()
+        sorted_cap_lens = Variable(sorted_cap_lens).cuda()
+    else:
+        captions = Variable(captions)
+        sorted_cap_lens = Variable(sorted_cap_lens)
+
+    return real_imgs, captions, sorted_cap_lens
 #----------------------------------------------------------------------------
 
 def setup_snapshot_image_grid(training_set, random_seed=0):
@@ -64,7 +108,13 @@ def setup_snapshot_image_grid(training_set, random_seed=0):
 
     # Load data.
     images, labels, labels_len = zip(*[training_set[i] for i in grid_indices])
-    return (gw, gh), np.stack(images), np.stack(labels), np.array(labels_len)
+    # print('############################')
+    # print(images[0].shape)
+    # print(labels)
+    # print(labels_len)
+    images, labels, labels_len = prepare_data(torch.from_numpy(np.stack(images)), torch.from_numpy(np.stack(labels)), torch.from_numpy(np.array(labels_len)))
+    return (gw, gh), images.cpu().numpy(), labels.cpu().numpy(), labels_len.cpu().numpy()
+    # return (gw, gh), np.stack(images), np.stack(labels), np.array(labels_len)
 
 #----------------------------------------------------------------------------
 
@@ -86,6 +136,96 @@ def save_image_grid(img, fname, drange, grid_size):
     if C == 3:
         PIL.Image.fromarray(img, 'RGB').save(fname)
 
+#----------------------------------------------------------------------------
+import torch.nn as nn
+from torch.autograd import Variable
+from torch.nn.utils.rnn import pack_padded_sequence, pad_packed_sequence
+
+class RNN_ENCODER(nn.Module):
+    def __init__(self, ntoken, ninput=300, drop_prob=0.5,
+                 nhidden=128, nlayers=1, bidirectional=True):
+        super(RNN_ENCODER, self).__init__()
+        self.n_steps = TEXT_WORDS_NUM
+        self.ntoken = ntoken  # size of the dictionary
+        self.ninput = ninput  # size of each embedding vector
+        self.drop_prob = drop_prob  # probability of an element to be zeroed
+        self.nlayers = nlayers  # Number of recurrent layers
+        self.bidirectional = bidirectional
+        self.rnn_type = 'LSTM'
+        if bidirectional:
+            self.num_directions = 2
+        else:
+            self.num_directions = 1
+        # number of features in the hidden state
+        self.nhidden = nhidden // self.num_directions
+
+        self.define_module()
+        self.init_weights()
+
+    def define_module(self):
+        self.encoder = nn.Embedding(self.ntoken, self.ninput)
+        self.drop = nn.Dropout(self.drop_prob)
+        if self.rnn_type == 'LSTM':
+            # dropout: If non-zero, introduces a dropout layer on
+            # the outputs of each RNN layer except the last layer
+            self.rnn = nn.LSTM(self.ninput, self.nhidden,
+                               self.nlayers, batch_first=True,
+                               dropout=self.drop_prob,
+                               bidirectional=self.bidirectional)
+        elif self.rnn_type == 'GRU':
+            self.rnn = nn.GRU(self.ninput, self.nhidden,
+                              self.nlayers, batch_first=True,
+                              dropout=self.drop_prob,
+                              bidirectional=self.bidirectional)
+        else:
+            raise NotImplementedError
+
+    def init_weights(self):
+        initrange = 0.1
+        self.encoder.weight.data.uniform_(-initrange, initrange)
+        # Do not need to initialize RNN parameters, which have been initialized
+        # http://pytorch.org/docs/master/_modules/torch/nn/modules/rnn.html#LSTM
+        # self.decoder.weight.data.uniform_(-initrange, initrange)
+        # self.decoder.bias.data.fill_(0)
+
+    def init_hidden(self, bsz):
+        weight = next(self.parameters()).data
+        if self.rnn_type == 'LSTM':
+            return (Variable(weight.new(self.nlayers * self.num_directions,
+                                        bsz, self.nhidden).zero_()),
+                    Variable(weight.new(self.nlayers * self.num_directions,
+                                        bsz, self.nhidden).zero_()))
+        else:
+            return Variable(weight.new(self.nlayers * self.num_directions,
+                                       bsz, self.nhidden).zero_())
+
+    def forward(self, captions, cap_lens, hidden, mask=None):
+        # input: torch.LongTensor of size batch x n_steps
+        # --> emb: batch x n_steps x ninput
+        emb = self.drop(self.encoder(captions))
+        #
+        # Returns: a PackedSequence object
+        cap_lens = cap_lens.data.tolist()
+        emb = pack_padded_sequence(emb, cap_lens, batch_first=True)
+        # #hidden and memory (num_layers * num_directions, batch, hidden_size):
+        # tensor containing the initial hidden state for each element in batch.
+        # #output (batch, seq_len, hidden_size * num_directions)
+        # #or a PackedSequence object:
+        # tensor containing output features (h_t) from the last layer of RNN
+        output, hidden = self.rnn(emb, hidden)
+        # PackedSequence object
+        # --> (batch, seq_len, hidden_size * num_directions)
+        output = pad_packed_sequence(output, batch_first=True)[0]
+        # output = self.drop(output)
+        # --> batch x hidden_size*num_directions x seq_len
+        words_emb = output.transpose(1, 2)
+        # --> batch x num_directions*hidden_size
+        if self.rnn_type == 'LSTM':
+            sent_emb = hidden[0].transpose(0, 1).contiguous()
+        else:
+            sent_emb = hidden.transpose(0, 1).contiguous()
+        sent_emb = sent_emb.view(-1, self.nhidden * self.num_directions)
+        return words_emb, sent_emb
 #----------------------------------------------------------------------------
 
 def training_loop(
@@ -150,12 +290,14 @@ def training_loop(
     if rank == 0:
         print('Constructing networks...')
     # T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
-    T_encoder = BertModel.from_pretrained('bert-base-uncased').to(device) #TODO: inistantiate this only when using captions
+    # T_encoder = BertModel.from_pretrained('bert-base-uncased').to(device) #TODO: inistantiate this only when using captions
+    #! move to a separate file. THERE ARE DUPLICATES
+    T_encoder = RNN_ENCODER(training_set.n_words, nhidden=TEXT_EMBEDDING_DIM).to(device)
     #! Some weights of the model checkpoint at bert-base-uncased were not used when initializing BertModel: ['cls.predictions.transform.dense.weight', 'cls.predictions.transform.LayerNorm.bias', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.transform.dense.bias', 'cls.predictions.bias', 'cls.seq_relationship.weight', 'cls.predictions.decoder.weight', 'cls.seq_relationship.bias']
     #! - This IS expected if you are initializing BertModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
     #! - This IS NOT expected if you are initializing BertModel from the checkpoint of a model that you expect to be exactly identical (initializing a BertForSequenceClassification model from a BertForSequenceClassification model).
-    # state_dict = torch.load('', map_location=lambda storage, loc: storage) #TODO: we need a pretrained model for DMSM
-    # T_encoder.load_state_dict(state_dict)
+    state_dict = torch.load(TRAIN_NET_E, map_location=lambda storage, loc: storage) #TODO: we need a pretrained model for DMSM
+    T_encoder.load_state_dict(state_dict)
     for p in T_encoder.parameters():
         p.requires_grad = False
     T_encoder.eval()
@@ -234,29 +376,34 @@ def training_loop(
     if rank == 0:
         print('Exporting sample images...')
         grid_size, images, labels, labels_len = setup_snapshot_image_grid(training_set=training_set)
-        grid_c = torch.from_numpy(labels).to(device) #TODO: distributed implementation
-        grid_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in labels_len]
-        grid_c_mask = torch.from_numpy(np.array(grid_c_mask)).to(device)
-        # captions = torch.autograd.Variable(torch.from_numpy(labels.squeeze())).cuda() #TODO: check why autograd is needed
-        # words_embs = T_encoder(grid_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
-        words_embs = T_encoder(grid_c, attention_mask=grid_c_mask)[0].contiguous()
-        # grid_c = words_embs[ :, :, -1 ].contiguous() # used with gpt2
-        max_len = torch.sum(grid_c_mask, dim=1).to(device)
-        sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
+        hidden = T_encoder.init_hidden(labels_len.shape[0])
+        labels = torch.from_numpy(labels).to(device)
+        labels_len = torch.from_numpy(labels_len).to(device)
+        words_embs, sent_embedding = T_encoder(labels, labels_len, hidden)
+        #BERT grid_c = torch.from_numpy(labels).to(device) #TODO: distributed implementation
+        #BERT grid_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in labels_len]
+        #BERT grid_c_mask = torch.from_numpy(np.array(grid_c_mask)).to(device)
+        #GPT captions = torch.autograd.Variable(torch.from_numpy(labels.squeeze())).cuda() #TODO: check why autograd is needed
+        #GPT words_embs = T_encoder(grid_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+        #BERT words_embs = T_encoder(grid_c, attention_mask=grid_c_mask)[0].contiguous()
+        #GPT grid_c = words_embs[ :, :, -1 ].contiguous() # used with gpt2
+        #BERT max_len = torch.sum(grid_c_mask, dim=1).to(device)
+        #BERT sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
         grid_c = sent_embedding.contiguous()
         save_image_grid(images, os.path.join(run_dir, 'reals.png'), drange=[0,255], grid_size=grid_size)
         grid_z = torch.randn([labels.shape[0], G.z_dim], device=device).split(batch_gpu)
         grid_c = grid_c.split(batch_gpu)
-        # grid_c = torch.from_numpy(captions).to(device).split(batch_gpu)
+        #GPT grid_c = torch.from_numpy(captions).to(device).split(batch_gpu)
         images = torch.cat([G_ema(z=z, c=c, noise_mode='const').cpu() for z, c in zip(grid_z, grid_c)]).numpy()
         save_image_grid(images, os.path.join(run_dir, 'fakes_init.png'), drange=[-1,1], grid_size=grid_size)
         tokenizer = BertTokenizer.from_pretrained('bert-base-uncased') #TODO: make a universal tokenizer
         with open(os.path.join(run_dir, 'captions.txt'), 'w') as f:
             for label, label_len in zip(labels, labels_len):
-                # l = np.argwhere(label).squeeze()[-1] + 1 # length of text
-                # f.write(' '.join([training_set.ixtoword[i] for i in label[:l]]))
-                f.write(' '.join(tokenizer.convert_ids_to_tokens(label[:label_len])))
-                f.write('\n')
+                label = label.cpu().numpy()
+                l = np.argwhere(label).squeeze()[-1] + 1 # length of text
+                f.write(' '.join([training_set.ixtoword[i] for i in label[:l]]))
+                # f.write(' '.join(tokenizer.convert_ids_to_tokens(label[:label_len])))
+                # f.write('\n')
 
     # Initialize logs.
     if rank == 0:
@@ -290,30 +437,47 @@ def training_loop(
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
             phase_real_img, phase_real_c, phase_real_c_lens = next(training_set_iterator)
+            print(phase_real_img.shape)
+            phase_real_img, phase_real_c, phase_real_c_lens = prepare_data(phase_real_img, phase_real_c, phase_real_c_lens)
             phase_real_c = phase_real_c.to(device)
-            phase_real_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in phase_real_c_lens]
-            phase_real_c_mask = torch.from_numpy(np.array(phase_real_c_mask)).to(device)
-            # words_embs = T_encoder(phase_real_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
-            words_embs = T_encoder(phase_real_c, attention_mask=phase_real_c_mask)[0].contiguous() #TODO: change this to reflect captions not labels
-            # phase_real_c = words_embs[ :, :, -1 ].contiguous()
-            max_len = torch.sum(phase_real_c_mask, dim=1).to(device)
-            sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
+            hidden = T_encoder.init_hidden(batch_size)
+            words_embs, sent_embedding = T_encoder(phase_real_c, phase_real_c_lens, hidden)
+            #BERT phase_real_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in phase_real_c_lens]
+            #BERT phase_real_c_mask = torch.from_numpy(np.array(phase_real_c_mask)).to(device)
+            #GPT words_embs = T_encoder(phase_real_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+            #BERT words_embs = T_encoder(phase_real_c, attention_mask=phase_real_c_mask)[0].contiguous() #TODO: change this to reflect captions not labels
+            #GPT phase_real_c = words_embs[ :, :, -1 ].contiguous()
+            #BERT max_len = torch.sum(phase_real_c_mask, dim=1).to(device)
+            #BERT sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
             phase_real_c = sent_embedding.contiguous()
             phase_real_img = (phase_real_img.to(device).to(torch.float32) / 127.5 - 1).split(batch_gpu)
             phase_real_c = phase_real_c.split(batch_gpu)
-            # phase_real_c = phase_real_c.to(device).split(batch_gpu)
+            #GPT phase_real_c = phase_real_c.to(device).split(batch_gpu)
             all_gen_z = torch.randn([len(phases) * batch_size, G.z_dim], device=device)
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
-            # all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
+            #GPT all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c, all_gen_c_lens = zip(*[training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)])
-            all_gen_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in all_gen_c_lens]
-            all_gen_c_mask = torch.from_numpy(np.array(all_gen_c_mask)).to(device)
-            all_gen_c = torch.from_numpy(np.stack(all_gen_c).squeeze()).pin_memory().to(device) #TODO: remove squeeze()
-            # words_embs = T_encoder(all_gen_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
-            words_embs = T_encoder(all_gen_c, attention_mask=all_gen_c_mask)[0].contiguous() #TODO: change this to reflect captions not labels
-            # all_gen_c = words_embs[ :, :, -1 ].contiguous()
-            max_len = torch.sum(all_gen_c_mask, dim=1).to(device)
-            sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
+            print(len(all_gen_c))
+            print(torch.from_numpy(np.stack(all_gen_c)).shape)
+            _, all_gen_c, all_gen_c_lens = prepare_data(None, torch.from_numpy(np.stack(all_gen_c)), torch.from_numpy(np.stack(all_gen_c_lens)))
+            #BERT all_gen_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in all_gen_c_lens]
+            #BERT all_gen_c_mask = torch.from_numpy(np.array(all_gen_c_mask)).to(device)
+            # all_gen_c = torch.from_numpy(np.stack(all_gen_c).squeeze()).pin_memory().to(device) #TODO: remove squeeze()
+            hidden2 = T_encoder.init_hidden(len(phases) * batch_size)
+            print(batch_size)
+            print('###########')
+            print(type(all_gen_c))
+            print(all_gen_c.shape)
+            print(type(all_gen_c_lens))
+            print(all_gen_c_lens.shape)
+            print(type(hidden2))
+            print(hidden2[0].shape)
+            words_embs, sent_embedding = T_encoder(all_gen_c, all_gen_c_lens, hidden2)
+            #GPT words_embs = T_encoder(all_gen_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
+            #BERT words_embs = T_encoder(all_gen_c, attention_mask=all_gen_c_mask)[0].contiguous() #TODO: change this to reflect captions not labels
+            #GPT all_gen_c = words_embs[ :, :, -1 ].contiguous()
+            #BERT max_len = torch.sum(all_gen_c_mask, dim=1).to(device)
+            #BERT sent_embedding = torch.sum(words_embs, dim=1) / max_len[:, None]
             all_gen_c = sent_embedding.contiguous()
             all_gen_c = [phase_gen_c.split(batch_gpu) for phase_gen_c in all_gen_c.split(batch_size)]
 

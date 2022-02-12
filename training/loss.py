@@ -12,6 +12,140 @@ from torch_utils import training_stats
 from torch_utils import misc
 from torch_utils.ops import conv2d_gradfix
 
+from torch.autograd import Variable
+
+import torch
+import torch.nn as nn
+
+import numpy as np
+#----------------------------------------------------------------------------
+# from torch import nn
+from torchvision import models
+from torch.nn import functional as F
+
+import torch.utils.model_zoo as model_zoo
+
+# modified cfg
+# TODO: add in a separate file
+TRAIN_FLAG = False #True
+TEXT_EMBEDDING_DIM = 256
+TRAIN_NET_E = './pretrained/image_encoder200.pth'
+TRAIN_SMOOTH_GAMMA3 = 10
+TRAIN_SMOOTH_LAMBDA = 5
+
+def conv1x1(in_planes, out_planes, bias=False):
+    "1x1 convolution with padding"
+    return nn.Conv2d(in_planes, out_planes, kernel_size=1, stride=1,
+                     padding=0, bias=bias)
+
+class CNN_ENCODER(nn.Module):
+    def __init__(self, nef):
+        super(CNN_ENCODER, self).__init__()
+        if TRAIN_FLAG:
+            self.nef = nef
+        else:
+            self.nef = 256  # define a uniform ranker
+
+        model = models.inception_v3()
+        url = 'https://download.pytorch.org/models/inception_v3_google-1a9a5a14.pth'
+        model.load_state_dict(model_zoo.load_url(url))
+        for param in model.parameters():
+            param.requires_grad = False
+        print('Load pretrained model from ', url)
+        # print(model)
+
+        self.define_module(model)
+        self.init_trainable_weights()
+
+    def define_module(self, model):
+        self.Conv2d_1a_3x3 = model.Conv2d_1a_3x3
+        self.Conv2d_2a_3x3 = model.Conv2d_2a_3x3
+        self.Conv2d_2b_3x3 = model.Conv2d_2b_3x3
+        self.Conv2d_3b_1x1 = model.Conv2d_3b_1x1
+        self.Conv2d_4a_3x3 = model.Conv2d_4a_3x3
+        self.Mixed_5b = model.Mixed_5b
+        self.Mixed_5c = model.Mixed_5c
+        self.Mixed_5d = model.Mixed_5d
+        self.Mixed_6a = model.Mixed_6a
+        self.Mixed_6b = model.Mixed_6b
+        self.Mixed_6c = model.Mixed_6c
+        self.Mixed_6d = model.Mixed_6d
+        self.Mixed_6e = model.Mixed_6e
+        self.Mixed_7a = model.Mixed_7a
+        self.Mixed_7b = model.Mixed_7b
+        self.Mixed_7c = model.Mixed_7c
+
+        self.emb_features = conv1x1(768, self.nef)
+        self.emb_cnn_code = nn.Linear(2048, self.nef)
+
+    def init_trainable_weights(self):
+        initrange = 0.1
+        self.emb_features.weight.data.uniform_(-initrange, initrange)
+        self.emb_cnn_code.weight.data.uniform_(-initrange, initrange)
+
+    def forward(self, x):
+        features = None
+        # --> fixed-size input: batch x 3 x 299 x 299
+        x = nn.functional.interpolate(x,size=(299, 299), mode='bilinear', align_corners=False)
+        # 299 x 299 x 3
+        x = self.Conv2d_1a_3x3(x)
+        # 149 x 149 x 32
+        x = self.Conv2d_2a_3x3(x)
+        # 147 x 147 x 32
+        x = self.Conv2d_2b_3x3(x)
+        # 147 x 147 x 64
+        x = F.max_pool2d(x, kernel_size=3, stride=2)
+        # 73 x 73 x 64
+        x = self.Conv2d_3b_1x1(x)
+        # 73 x 73 x 80
+        x = self.Conv2d_4a_3x3(x)
+        # 71 x 71 x 192
+
+        x = F.max_pool2d(x, kernel_size=3, stride=2)
+        # 35 x 35 x 192
+        x = self.Mixed_5b(x)
+        # 35 x 35 x 256
+        x = self.Mixed_5c(x)
+        # 35 x 35 x 288
+        x = self.Mixed_5d(x)
+        # 35 x 35 x 288
+
+        x = self.Mixed_6a(x)
+        # 17 x 17 x 768
+        x = self.Mixed_6b(x)
+        # 17 x 17 x 768
+        x = self.Mixed_6c(x)
+        # 17 x 17 x 768
+        x = self.Mixed_6d(x)
+        # 17 x 17 x 768
+        x = self.Mixed_6e(x)
+        # 17 x 17 x 768
+
+        # image region features
+        features = x
+        # 17 x 17 x 768
+
+        x = self.Mixed_7a(x)
+        # 8 x 8 x 1280
+        x = self.Mixed_7b(x)
+        # 8 x 8 x 2048
+        x = self.Mixed_7c(x)
+        # 8 x 8 x 2048
+        x = F.avg_pool2d(x, kernel_size=8)
+        # 1 x 1 x 2048
+        # x = F.dropout(x, training=self.training)
+        # 1 x 1 x 2048
+        x = x.view(x.size(0), -1)
+        # 2048
+
+        # global image features
+        cnn_code = self.emb_cnn_code(x)
+        # 512
+        if features is not None:
+            features = self.emb_features(features)
+
+        return features, cnn_code
+
 #----------------------------------------------------------------------------
 
 class Loss:
@@ -62,16 +196,97 @@ class StyleGAN2Loss(Loss):
         do_Dr1   = (phase in ['Dreg', 'Dboth']) and (self.r1_gamma != 0)
 
         # Gmain: Maximize logits for generated images.
+        # *DMSM
+        def sent_loss(cnn_code, rnn_code, labels, class_ids,
+            batch_size, eps=1e-8):
+            # ### Mask mis-match samples  ###
+            # that come from the same class as the real sample ###
+            masks = []
+            if class_ids is not None:
+                for i in range(batch_size):
+                    mask = (class_ids == class_ids[i]).astype(np.uint8)
+                    mask[i] = 0
+                    masks.append(mask.reshape((1, -1)))
+                masks = np.concatenate(masks, 0)
+                # masks: batch_size x batch_size
+                masks = torch.ByteTensor(masks)
+                if self.device:
+                    masks = masks.cuda()
+                masks = masks.bool()
+            # --> seq_len x batch_size x nef
+            if cnn_code.dim() == 2:
+                cnn_code = cnn_code.unsqueeze(0)
+                rnn_code = rnn_code.unsqueeze(0)
+            # cnn_code_norm / rnn_code_norm: seq_len x batch_size x 1
+            cnn_code_norm = torch.norm(cnn_code, 2, dim=2, keepdim=True)
+            rnn_code_norm = torch.norm(rnn_code, 2, dim=2, keepdim=True)
+            # scores* / norm*: seq_len x batch_size x batch_size
+            # print( cnn_code.shape, rnn_code.shape )
+            scores0 = torch.bmm(cnn_code, rnn_code.transpose(1, 2))
+            norm0 = torch.bmm(cnn_code_norm, rnn_code_norm.transpose(1, 2))
+            scores0 = scores0 / norm0.clamp(min=eps) * TRAIN_SMOOTH_GAMMA3
+            # --> batch_size x batch_size
+            scores0 = scores0.squeeze()
+            if class_ids is not None:
+                scores0.data.masked_fill_(masks, -float('inf'))
+            scores1 = scores0.transpose(0, 1)
+            if labels is not None:
+                loss0 = nn.CrossEntropyLoss()(scores0, labels)
+                loss1 = nn.CrossEntropyLoss()(scores1, labels)
+            else:
+                loss0, loss1 = None, None
+            return loss0, loss1
+
+        # DMSM = True
+        # if DMSM:
+
+        #     with torch.autograd.profiler.record_function('DMSM_forward'):
+        #         gen_img, _gen_ws = self.run_G(gen_z, gen_c, sync=(sync and not do_Gpl)) # May get synced by Gpl.
+        #         #CNN embeddings
+
+        #         #! Change batch size when needed
+        #         batch_size = 4
+        #         match_labels = Variable(torch.LongTensor(range(batch_size)))
+        #         class_ids = None
+        #         s_loss0, s_loss1 = sent_loss(cnn_code, gen_c,
+        #             match_labels, class_ids, batch_size)
+        #         s_loss = (s_loss0 + s_loss1) * TRAIN_SMOOTH_LAMBDA
+                
+        #         training_stats.report('Loss/G/loss_DMSM', s_loss)
+        #     with torch.autograd.profiler.record_function('DMSM_backward'):
+        #         s_loss.backward()
+
         if do_Gmain:
+            # Image Encoder
+            image_encoder = CNN_ENCODER(TEXT_EMBEDDING_DIM).to(self.device)
+            img_encoder_path = TRAIN_NET_E
+            state_dict = torch.load(img_encoder_path, map_location=lambda storage, loc: storage)
+            image_encoder.load_state_dict(state_dict)
+            for p in image_encoder.parameters():
+                p.requires_grad = False
+            image_encoder.eval()
+            image_encoder=image_encoder.to(self.device)
+
             with torch.autograd.profiler.record_function('Gmain_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, sync=(sync and not do_Gpl)) # May get synced by Gpl.
                 gen_logits = self.run_D(gen_img, gen_c, sync=False)
+                region_features, cnn_code = image_encoder(gen_img)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
+
                 loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))
+                #! Change batch size when needed
+                batch_size = 16
+                match_labels = Variable(torch.LongTensor(range(batch_size))).cuda()
+                class_ids = None
+                s_loss0, s_loss1 = sent_loss(cnn_code, gen_c,
+                    match_labels, class_ids, batch_size)
+                s_loss = (s_loss0 + s_loss1) * TRAIN_SMOOTH_LAMBDA
+                
                 training_stats.report('Loss/G/loss', loss_Gmain)
+                training_stats.report('Loss/G/DAMSM', loss_Gmain)
             with torch.autograd.profiler.record_function('Gmain_backward'):
-                loss_Gmain.mean().mul(gain).backward()
+                (loss_Gmain.mean().mul(gain)+s_loss).backward()
 
         # Gpl: Apply path length regularization.
         if do_Gpl:

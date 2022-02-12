@@ -158,7 +158,7 @@ class Dataset(torch.utils.data.Dataset):
     @property
     def label_shape(self):
         if self.name == 'birds' and self._use_labels: #TODO: change this to reflect captions not labels
-            return [768]
+            return [256] #![768] uncomment using BERT
         if self._label_shape is None:
             raw_labels = self._get_raw_labels()[0] #TODO: remove if length is removed
             if raw_labels.dtype == np.int64:
@@ -517,22 +517,23 @@ class TextDataset(Dataset):
                 n_words = len(ixtoword)
                 print('Load from: ', filepath)
 
-        tokenizer = BertTokenizer.from_pretrained('bert-base-uncased') #TODO: make a universal tokenizer
-        all_tokens_train = []
-        for tokens in train_captions:
-            tokens = [ixtoword[i] for i in tokens]
-            tokens = ['[CLS]'] + tokens + ['[SEP]']
-            tokens = tokenizer.convert_tokens_to_ids(tokens)
-            all_tokens_train.append(tokens)
-        all_tokens_test = []
-        for tokens in test_captions:
-            tokens = [ixtoword[i] for i in tokens]
-            tokens = ['[CLS]'] + tokens + ['[SEP]']
-            tokens = tokenizer.convert_tokens_to_ids(tokens)
-            all_tokens_test.append(tokens)
+        #! uncomment when using BERT
+        # tokenizer = BertTokenizer.from_pretrained('bert-base-uncased') #TODO: make a universal tokenizer
+        # all_tokens_train = []
+        # for tokens in train_captions:
+        #     tokens = [ixtoword[i] for i in tokens]
+        #     tokens = ['[CLS]'] + tokens + ['[SEP]']
+        #     tokens = tokenizer.convert_tokens_to_ids(tokens)
+        #     all_tokens_train.append(tokens)
+        # all_tokens_test = []
+        # for tokens in test_captions:
+        #     tokens = [ixtoword[i] for i in tokens]
+        #     tokens = ['[CLS]'] + tokens + ['[SEP]']
+        #     tokens = tokenizer.convert_tokens_to_ids(tokens)
+        #     all_tokens_test.append(tokens)
         
-        train_captions = all_tokens_train
-        test_captions = all_tokens_test
+        # train_captions = all_tokens_train
+        # test_captions = all_tokens_test
 
         if split == 'train':
             # a list of list: each list contains
