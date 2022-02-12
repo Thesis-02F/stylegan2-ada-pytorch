@@ -8,6 +8,8 @@
 
 """Train a GAN using the techniques described in the paper
 "Training Generative Adversarial Networks with Limited Data"."""
+import warnings
+warnings.filterwarnings("ignore")
 
 import os
 import click
