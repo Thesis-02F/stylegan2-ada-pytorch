@@ -34,7 +34,7 @@ TEXT_WORDS_NUM = 18#+2
 #----------------------------------------------------------------------------
 
 from torch.autograd import Variable
-def prepare_data(imgs, captions, captions_lens):
+def prepare_data(imgs, captions, captions_lens, device=None):
     #! changes this to a separate input
     CUDA = True
     # imgs, captions, captions_lens, class_ids, keys = data
@@ -45,8 +45,10 @@ def prepare_data(imgs, captions, captions_lens):
 
     if imgs is not None:
         real_imgs = imgs[sorted_cap_indices]
-        if CUDA:
+        if CUDA and device is None:
             real_imgs = Variable(real_imgs).cuda()
+        elif device:
+            real_imgs = Variable(real_imgs).to(device)
         else:
             real_imgs = Variable(real_imgs)
     else:
@@ -63,9 +65,12 @@ def prepare_data(imgs, captions, captions_lens):
     # sent_indices = sent_indices[sorted_cap_indices]
     # keys = [keys[i] for i in sorted_cap_indices.numpy()]
     # print('keys', type(keys), keys[-1])  # list
-    if CUDA:
+    if CUDA and device is None:
         captions = Variable(captions).cuda()
         sorted_cap_lens = Variable(sorted_cap_lens).cuda()
+    elif device:
+        captions = Variable(captions).to(device)
+        sorted_cap_lens = Variable(sorted_cap_lens).to(device)
     else:
         captions = Variable(captions)
         sorted_cap_lens = Variable(sorted_cap_lens)
@@ -292,6 +297,7 @@ def training_loop(
     # T_encoder = GPT2Model.from_pretrained('gpt2').to(device) #TODO: inistantiate this only when using captions
     # T_encoder = BertModel.from_pretrained('bert-base-uncased').to(device) #TODO: inistantiate this only when using captions
     #! move to a separate file. THERE ARE DUPLICATES
+    print(device)
     T_encoder = RNN_ENCODER(training_set.n_words, nhidden=TEXT_EMBEDDING_DIM).to(device)
     #! Some weights of the model checkpoint at bert-base-uncased were not used when initializing BertModel: ['cls.predictions.transform.dense.weight', 'cls.predictions.transform.LayerNorm.bias', 'cls.predictions.transform.LayerNorm.weight', 'cls.predictions.transform.dense.bias', 'cls.predictions.bias', 'cls.seq_relationship.weight', 'cls.predictions.decoder.weight', 'cls.seq_relationship.bias']
     #! - This IS expected if you are initializing BertModel from the checkpoint of a model trained on another task or with another architecture (e.g. initializing a BertForSequenceClassification model from a BertForPreTraining model).
@@ -344,6 +350,8 @@ def training_loop(
             module.requires_grad_(False)
         if name is not None:
             ddp_modules[name] = module
+    # if (num_gpus> 1):
+        # T_encoder = torch.nn.parallel.DistributedDataParallel(T_encoder, device_ids=[device], broadcast_buffers=False)
 
     # Setup training phases.
     if rank == 0:
@@ -403,7 +411,7 @@ def training_loop(
                 l = np.argwhere(label).squeeze()[-1] + 1 # length of text
                 f.write(' '.join([training_set.ixtoword[i] for i in label[:l]]))
                 # f.write(' '.join(tokenizer.convert_ids_to_tokens(label[:label_len])))
-                # f.write('\n')
+                f.write('\n')
 
     # Initialize logs.
     if rank == 0:
@@ -436,11 +444,12 @@ def training_loop(
 
         # Fetch training data.
         with torch.autograd.profiler.record_function('data_fetch'):
+            
             phase_real_img, phase_real_c, phase_real_c_lens = next(training_set_iterator)
-            print(phase_real_img.shape)
-            phase_real_img, phase_real_c, phase_real_c_lens = prepare_data(phase_real_img, phase_real_c, phase_real_c_lens)
-            phase_real_c = phase_real_c.to(device)
-            hidden = T_encoder.init_hidden(batch_size)
+            # print(phase_real_img.shape)
+            phase_real_img, phase_real_c, phase_real_c_lens = prepare_data(phase_real_img, phase_real_c, phase_real_c_lens, device)
+            # phase_real_c = phase_real_c.to(device)
+            hidden = T_encoder.init_hidden(batch_gpu)
             words_embs, sent_embedding = T_encoder(phase_real_c, phase_real_c_lens, hidden)
             #BERT phase_real_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in phase_real_c_lens]
             #BERT phase_real_c_mask = torch.from_numpy(np.array(phase_real_c_mask)).to(device)
@@ -457,21 +466,23 @@ def training_loop(
             all_gen_z = [phase_gen_z.split(batch_gpu) for phase_gen_z in all_gen_z.split(batch_size)]
             #GPT all_gen_c = [training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)]
             all_gen_c, all_gen_c_lens = zip(*[training_set.get_label(np.random.randint(len(training_set))) for _ in range(len(phases) * batch_size)])
-            print(len(all_gen_c))
-            print(torch.from_numpy(np.stack(all_gen_c)).shape)
-            _, all_gen_c, all_gen_c_lens = prepare_data(None, torch.from_numpy(np.stack(all_gen_c)), torch.from_numpy(np.stack(all_gen_c_lens)))
+            # print(len(all_gen_c))
+            # print(torch.from_numpy(np.stack(all_gen_c)).shape)
+            _, all_gen_c, all_gen_c_lens = prepare_data(None, torch.from_numpy(np.stack(all_gen_c)), torch.from_numpy(np.stack(all_gen_c_lens)), device)
             #BERT all_gen_c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in all_gen_c_lens]
             #BERT all_gen_c_mask = torch.from_numpy(np.array(all_gen_c_mask)).to(device)
             # all_gen_c = torch.from_numpy(np.stack(all_gen_c).squeeze()).pin_memory().to(device) #TODO: remove squeeze()
+
+            # print(len(phases) * batch_size)
             hidden2 = T_encoder.init_hidden(len(phases) * batch_size)
-            print(batch_size)
-            print('###########')
-            print(type(all_gen_c))
-            print(all_gen_c.shape)
-            print(type(all_gen_c_lens))
-            print(all_gen_c_lens.shape)
-            print(type(hidden2))
-            print(hidden2[0].shape)
+            # print(batch_size)
+            # print('###########')
+            # print(type(all_gen_c))
+            # print(all_gen_c.shape)
+            # print(type(all_gen_c_lens))
+            # print(all_gen_c_lens.shape)
+            # print(type(hidden2))
+            # print(hidden2[0].shape)
             words_embs, sent_embedding = T_encoder(all_gen_c, all_gen_c_lens, hidden2)
             #GPT words_embs = T_encoder(all_gen_c)[0].transpose(1, 2).contiguous() #TODO: change this to reflect captions not labels
             #BERT words_embs = T_encoder(all_gen_c, attention_mask=all_gen_c_mask)[0].contiguous() #TODO: change this to reflect captions not labels

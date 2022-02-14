@@ -168,6 +168,10 @@ class StyleGAN2Loss(Loss):
         self.pl_decay = pl_decay
         self.pl_weight = pl_weight
         self.pl_mean = torch.zeros([], device=device)
+        self.image_encoder = CNN_ENCODER(TEXT_EMBEDDING_DIM).to(self.device)
+        img_encoder_path = TRAIN_NET_E
+        state_dict = torch.load(img_encoder_path, map_location=lambda storage, loc: storage)
+        self.image_encoder.load_state_dict(state_dict)
 
     def run_G(self, z, c, sync):
         with misc.ddp_sync(self.G_mapping, sync):
@@ -198,7 +202,7 @@ class StyleGAN2Loss(Loss):
         # Gmain: Maximize logits for generated images.
         # *DMSM
         def sent_loss(cnn_code, rnn_code, labels, class_ids,
-            batch_size, eps=1e-8):
+            batch_size, eps=1e-8, ):
             # ### Mask mis-match samples  ###
             # that come from the same class as the real sample ###
             masks = []
@@ -211,7 +215,7 @@ class StyleGAN2Loss(Loss):
                 # masks: batch_size x batch_size
                 masks = torch.ByteTensor(masks)
                 if self.device:
-                    masks = masks.cuda()
+                    masks = masks.to(self.device)
                 masks = masks.bool()
             # --> seq_len x batch_size x nef
             if cnn_code.dim() == 2:
@@ -231,6 +235,7 @@ class StyleGAN2Loss(Loss):
                 scores0.data.masked_fill_(masks, -float('inf'))
             scores1 = scores0.transpose(0, 1)
             if labels is not None:
+                # print(self.device, ':',scores0.device, labels.device)
                 loss0 = nn.CrossEntropyLoss()(scores0, labels)
                 loss1 = nn.CrossEntropyLoss()(scores1, labels)
             else:
@@ -258,33 +263,31 @@ class StyleGAN2Loss(Loss):
 
         if do_Gmain:
             # Image Encoder
-            image_encoder = CNN_ENCODER(TEXT_EMBEDDING_DIM).to(self.device)
-            img_encoder_path = TRAIN_NET_E
-            state_dict = torch.load(img_encoder_path, map_location=lambda storage, loc: storage)
-            image_encoder.load_state_dict(state_dict)
-            for p in image_encoder.parameters():
+            # image_encoder = CNN_ENCODER(TEXT_EMBEDDING_DIM).to(self.device)
+            
+            for p in self.image_encoder.parameters():
                 p.requires_grad = False
-            image_encoder.eval()
-            image_encoder=image_encoder.to(self.device)
+            self.image_encoder.eval()
+            self.image_encoder=self.image_encoder.to(self.device)
 
             with torch.autograd.profiler.record_function('Gmain_forward'):
                 gen_img, _gen_ws = self.run_G(gen_z, gen_c, sync=(sync and not do_Gpl)) # May get synced by Gpl.
                 gen_logits = self.run_D(gen_img, gen_c, sync=False)
-                region_features, cnn_code = image_encoder(gen_img)
+                region_features, cnn_code = self.image_encoder(gen_img)
                 training_stats.report('Loss/scores/fake', gen_logits)
                 training_stats.report('Loss/signs/fake', gen_logits.sign())
 
                 loss_Gmain = torch.nn.functional.softplus(-gen_logits) # -log(sigmoid(gen_logits))
                 #! Change batch size when needed
                 batch_size = 16
-                match_labels = Variable(torch.LongTensor(range(batch_size))).cuda()
+                match_labels = Variable(torch.LongTensor(range(batch_size))).to(self.device)
                 class_ids = None
                 s_loss0, s_loss1 = sent_loss(cnn_code, gen_c,
                     match_labels, class_ids, batch_size)
                 s_loss = (s_loss0 + s_loss1) * TRAIN_SMOOTH_LAMBDA
                 
                 training_stats.report('Loss/G/loss', loss_Gmain)
-                training_stats.report('Loss/G/DAMSM', loss_Gmain)
+                training_stats.report('Loss/G/DAMSM', s_loss)
             with torch.autograd.profiler.record_function('Gmain_backward'):
                 (loss_Gmain.mean().mul(gain)+s_loss).backward()
 

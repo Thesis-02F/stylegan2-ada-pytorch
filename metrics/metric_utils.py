@@ -232,7 +232,7 @@ def compute_feature_stats_for_dataset(opts, detector_url, detector_kwargs, rel_l
 
 #----------------------------------------------------------------------------
 from torch.autograd import Variable
-def prepare_data(imgs, captions, captions_lens):
+def prepare_data(imgs, captions, captions_lens, device=None):
     #! changes this to a separate input
     CUDA = True
     # imgs, captions, captions_lens, class_ids, keys = data
@@ -243,8 +243,10 @@ def prepare_data(imgs, captions, captions_lens):
 
     if imgs is not None:
         real_imgs = imgs[sorted_cap_indices]
-        if CUDA:
+        if CUDA and device is None:
             real_imgs = Variable(real_imgs).cuda()
+        elif device:
+            real_imgs = Variable(real_imgs).to(device)
         else:
             real_imgs = Variable(real_imgs)
     else:
@@ -261,9 +263,12 @@ def prepare_data(imgs, captions, captions_lens):
     # sent_indices = sent_indices[sorted_cap_indices]
     # keys = [keys[i] for i in sorted_cap_indices.numpy()]
     # print('keys', type(keys), keys[-1])  # list
-    if CUDA:
+    if CUDA and device is None:
         captions = Variable(captions).cuda()
         sorted_cap_lens = Variable(sorted_cap_lens).cuda()
+    elif device:
+        captions = Variable(captions).to(device)
+        sorted_cap_lens = Variable(sorted_cap_lens).to(device)
     else:
         captions = Variable(captions)
         sorted_cap_lens = Variable(sorted_cap_lens)
@@ -410,7 +415,7 @@ def compute_feature_stats_for_generator(opts, detector_url, detector_kwargs, rel
             z = torch.randn([batch_gen, G.z_dim], device=opts.device)
             #GPT c = [dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_gen)]
             c, c_lens = zip(*[dataset.get_label(np.random.randint(len(dataset))) for _i in range(batch_gen)])
-            _, c, c_lens = prepare_data(None, torch.from_numpy(np.stack(c)), torch.from_numpy(np.stack(c_lens)))
+            _, c, c_lens = prepare_data(None, torch.from_numpy(np.stack(c)), torch.from_numpy(np.stack(c_lens)), opts.device)
             hidden = T_encoder.init_hidden(batch_gen)
             words_embs, sent_embedding = T_encoder(c, c_lens, hidden)
             #BERT c_mask = [label_len * [1] + (20 - label_len) * [0] for label_len in c_lens]

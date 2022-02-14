@@ -3,7 +3,7 @@ cachetools==4.2.4
 certifi==2021.10.8
 charset-normalizer==2.0.7
 click==8.0.3
-dataclasses==0.8
+dataclasses==0.6
 google-auth==2.3.0
 google-auth-oauthlib==0.4.6
 grpcio==1.41.0
@@ -14,7 +14,6 @@ numpy==1.19.5
 nltk==3.6.5
 oauthlib==3.1.1
 Pillow==8.4.0
-pkg_resources==0.0.0
 protobuf==3.19.0
 psutil==5.8.0
 pyasn1==0.4.8
